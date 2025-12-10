@@ -1,0 +1,941 @@
+---
+title: "Projekt - Elektrody grafenowe"
+output: html_document
+date: "2025-11-16"
+---
+
+# Streszczenie 
+
+## Cel badania
+
+Analiza obejmuje eksplorację zbioru danych zawierającego 925 obserwacji dotyczących elektrod grafenowych stosowanych w superkondensatorach.
+Dane w zbiorze opisują budowę tych elektrod, uzyskane wydajności oraz inne parametry dotyczące testowania  działania elektrod. Głównym celem było zidentyfikowanie kluczowych czynników wpływających na pojemność elektrody (Capacitance) oraz zbudowanie modelu predykcyjnego umożliwiającego prognozowanie tej wartości na podstawie użytych materiałow ich parametrów fizykochemicznych i warunków testowych.
+
+## Zakres analizy - Spis treści
+
+Badanie przeprowadzono według następującego schematu:
+
+1. [Konfiguracja środowiska i wykorzystane biblioteki](#konfiguracja-środowiska-i-wykorzystane-biblioteki)
+2. [Wczytanie i inspekcja danych](#wczytanie-i-inspekcja-danych)
+3. [Przetwarzanie brakujących danych](#przetwarzanie-brakujących-danych)
+4. [Rozmiar zbioru i podstawowe statystyki](#rozmiar-zbioru-i-podstawowe-statystyki)
+5. [Szczegółowa analiza wartości atrybutów](#szczegółowa-analiza-wartości-atrybutów)
+6. [Korelacje między zmiennymi](#korelacje-między-zmiennymi)
+7. [Interaktywne wykresy](#interaktywne-wykresy)
+8. [Predykcja pojemności i wyjaśnialna sztuczna inteligencja](#predykcja-pojemności-i-wyjaśnialna-sztuczna-inteligencja)
+9. [Wnioski](#wnioski)
+
+## Najważniejsze wyniki 
+
+Po oczyszczeniu danych uzyskano finalny zbiór zawierający 908 obserwacji i 12 zmiennych, z zerowym udziałem wartości NaN. 
+Dane charakteryzują się wysoką heterogenicznością oraz brakiem normalności rozkładów. Korelacje między zmiennymi są przeważnie słabe. Warunki testowe odgrywają większą rolę w określeniu pojemności niż same właściwości materiałowe elektrod. Obcięcie wartości ekstremalnych dla 5 zmiennych z >10% outlierów poprawiło stabilność modeli. 
+
+Model Random Forest osiągnął współczynnik determinacji R² = 0.7, wykazując najlepszą zdolność predykcyjną spośród testowanych algorytmów (SVR: R² = 0.31, Elastic Net: R² = 0.17). Uzyskał on najniższy błąd RMSE = 237.88 F/g oraz MAE = 137.39 F/g, co potwierdza jego przewagę nad metodami liniowymi w obsłudze nieliniowych zależności. Interpretacja  Analiza SHAP SHAP wykazała, że warunki eksperymentalne (przedział potencjału, typ elektrolitu) mają większy wpływ na pojemność niż cechy strukturalne materiałów (SSA, Ratio ID/IG).
+
+
+
+---
+
+# Konfiguracja środowiska i wykorzystane biblioteki
+
+```{r setup, include=FALSE, cache=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6,
+  cache = FALSE,
+  cache.path = "cache/"
+)
+
+if (!dir.exists("cache")) dir.create("cache")
+```
+
+## Wykorzystane pakiety R
+
+```{r libraries, message=FALSE, warning=FALSE}
+packages <- c(
+  "tidyverse", "dplyr", "readr", "knitr", "kableExtra", "corrplot", "plotly",
+  "randomForest", "caret", "psych", "gridExtra",
+  "DataExplorer", "fastshap", "DescTools", "glmnet"
+)
+
+new_packages <- packages[!(packages %in% installed.packages()[,"Package"])]
+if (length(new_packages)) {
+  install.packages(new_packages, dependencies = TRUE, quiet = TRUE)
+}
+
+load_package <- function(pkg) {
+  if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+    stop(paste("Nie udało się załadować pakietu:", pkg))
+  }
+  TRUE
+}
+invisible(sapply(packages, load_package))
+```
+
+**Tabela 1. Wykorzystane pakiety i ich funkcje**
+
+| Pakiet | Funkcja w projekcie |
+|--------|---------------------|
+| tidyverse | Zintegrowany zestaw narzędzi do manipulacji i wizualizacji danych |
+| dplyr | Operacje na ramkach danych: filtrowanie, grupowanie, agregacja |
+| readr | Wczytywanie plików CSV z automatycznym wykrywaniem typów |
+| knitr | Generowanie dynamicznych raportów HTML |
+| kableExtra | Formatowanie i stylizacja tabel |
+| corrplot | Wizualizacja macierzy korelacji |
+| plotly | Tworzenie interaktywnych wykresów |
+| randomForest | Implementacja algorytmu Random Forest |
+| caret | Framework do trenowania i walidacji modeli ML |
+| psych | Zaawansowane narzędzia statystyczne (describe) |
+| gridExtra | Układanie wielu wykresów w siatce |
+| DataExplorer | Automatyczna eksploracja danych (plot_missing) |
+| fastshap | Obliczanie wartości SHAP dla interpretacji modeli |
+| DescTools | Dodatkowe narzędzia statystyczne (CramerV) |
+| glmnet | Modele liniowe z regularyzacją (Elastic Net) |
+
+### Zapewnienie powtarzalności wyników
+
+```{r seed}
+set.seed(123)
+```
+
+Ustalenie ziarna generatora liczb pseudolosowych zapewnia pełną powtarzalność wyników przy każdym uruchomieniu analizy.
+
+# Wczytanie i inspekcja danych
+
+```{r data-loading}
+data <- read_csv("data.csv", show_col_types = FALSE)
+
+cat("Wymiary zbioru danych:", nrow(data), "obserwacji i", ncol(data), "zmiennych\n\n")
+cat("Nazwy kolumn:\n")
+cat(paste(names(data), collapse = "\n"))
+
+data %>% 
+  head(10) %>% 
+  kable(caption = "Tabela 2. Podgląd pierwszych 10 obserwacji") %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),  full_width = TRUE,font_size = 10)
+```
+
+Zbiór danych zawiera informacje o elektrodach grafitowych testowanych w warunkach laboratoryjnych. Każda obserwacja reprezentuje pojedynczy eksperyment z wyszczególnioną konfiguracją, materiałami i parametrami pomiarowymi.
+
+# Przetwarzanie brakujących danych
+
+## Analiza przed czyszczeniem
+
+```{r nan-analysis}
+missing_summary <- data %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "Zmienna", values_to = "Liczba_NA") %>%  
+  mutate(Procent_NA = round(Liczba_NA / nrow(data) * 100, 2)) %>%
+  arrange(desc(Procent_NA))    
+
+missing_summary %>%
+  kable(caption = "Tabela 3. Procent wartości brakujących przed czyszczeniem",  
+        col.names = c("Zmienna", "Liczba NA", "Procent NA (%)")) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),  
+        full_width = FALSE) %>%
+  row_spec(which(missing_summary$Procent_NA > 70), bold = TRUE, color = "white", background = "#d45a57")
+```
+
+```{r nan-visualization, fig.height=7}
+plot_missing(data, title = "Wizualizacja wartości brakujących")
+```
+
+Analiza wykazała istotne braki w zmiennych: Specific Surface Area (61%), Charge Transfer Resistance (85%), Equivalent Series Resistance (83%), oraz parametrach struktury porowatej i składu chemicznego (69-83% braków).
+
+## Charakterystyka typów danych
+
+```{r data-types}
+data.frame(
+  Kolumna = names(data),
+  Typ = sapply(data, class)
+) %>%
+  kable(caption = "Tabela 4. Typy danych w kolumnach") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),full_width = FALSE) 
+
+num_vars <- data %>% select(where(is.numeric)) 
+data.frame(
+  Zmienna = names(num_vars), 
+  Brakujące = sapply(num_vars, function(x) sum(is.na(x))),
+  Procent_NA = sapply(num_vars, function(x) round(sum(is.na(x))/length(x)*100, 2)) 
+) %>%
+  kable(caption = "Tabela 5. Zmienne numeryczne - statystyka braków",
+        col.names = c("Zmienna", "Liczba NA", "Procent NA (%)")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+ 
+cat_vars <- data %>% select(where(~ is.character(.) | is.factor(.)))
+data.frame(
+  Zmienna = names(cat_vars),   
+  Brakujące = sapply(cat_vars, function(x) sum(is.na(x))), 
+  Kategorie = sapply(cat_vars, function(x) n_distinct(x, na.rm = TRUE)) 
+) %>%
+  kable(caption = "Tabela 6. Zmienne kategoryczne - statystyka",
+        col.names = c("Zmienna", "Liczba NA", "Liczba kategorii")) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))   
+```
+
+## Czyszczenia danych
+
+
+*Etap 1: Usunięcie kolumn z wysokim odsetkiem braków*
+
+Kolumny zawierające ponad 70% wartości brakujących zostały usunięte z analizy.
+
+- Nadmierna imputacja zniekształciłaby  rozkłady i zafałszowala wyniki analiz statystycznych,
+- Usunięcie wierszy zmniejszyłoby zbiór do poniżej 200 obserwacji.
+
+*Etap 2: Wyliczenie wartości dla okna potencjału*
+
+Wykorzystano relacje  między dolną granicą, górną granicą i szerokością okna potencjalu.
+
+*Etap 3: Imputacja pozostałych braków*
+
+- Zmienne numeryczne: mediana (odporna na wartości odstające),
+- Zmienne kategoryczne: moda - najczęstsza kategoria.
+
+*Etap 4: Usunięcie obserwacji bez zmiennej docelowej*
+
+Wiersze bez wartości Capacitance zostały usunięte.
+
+### Implementacja czyszczenia
+
+```{r data-cleaning}
+na_before <- sapply(data, function(x) sum(is.na(x)))
+
+data_fix <- data %>%
+  mutate(
+    `Potential Window (V)` = coalesce(`Potential Window (V)`,
+                                      `Upper Limit of Potential Window (V)` - `Lower Limit of Potential Window (V)`),
+    `Upper Limit of Potential Window (V)` = coalesce(`Upper Limit of Potential Window (V)`,
+                                                    `Lower Limit of Potential Window (V)` + `Potential Window (V)`),
+    `Lower Limit of Potential Window (V)` = coalesce(`Lower Limit of Potential Window (V)`,
+                                                    `Upper Limit of Potential Window (V)` - `Potential Window (V)`),
+    `Limits of Potential Window (V)` = coalesce(`Limits of Potential Window (V)`,
+                                                paste(`Lower Limit of Potential Window (V)`, "to", `Upper Limit of Potential Window (V)`)))
+
+na_after <- sapply(data_fix, function(x) sum(is.na(x)))
+
+cols_window <- c("Potential Window (V)", "Upper Limit of Potential Window (V)", 
+                 "Lower Limit of Potential Window (V)", "Limits of Potential Window (V)")
+filled_summary <- data.frame(
+  Kolumna = cols_window,
+  NA_przed = na_before[cols_window],
+  NA_po = na_after[cols_window],
+  Uzupełnione = na_before[cols_window] - na_after[cols_window]
+)
+
+filled_summary %>%
+  kable(caption = "Tabela 7. Uzupełnienie wartości okna potencjału") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+data_clean <- data_fix %>%
+  select(-`Ref.`, -`Electrode Configuration`) %>%
+  select(where(~ mean(is.na(.)) < 0.7))
+
+rows_before <- nrow(data_clean)
+data_clean <- data_clean %>% filter(!is.na(`Capacitance (F/g)`))
+rows_after <- nrow(data_clean)
+removed_rows <- rows_before - rows_after
+
+cat("\nUsunięto wierszy bez zmiennej docelowej:", removed_rows, "\n")
+cat("Pozostało obserwacji:", rows_after, "\n\n")
+
+data_imputed <- data_clean
+
+num_cols <- names(data_imputed)[sapply(data_imputed, is.numeric)]
+for (col in num_cols) {
+  data_imputed[[col]][is.na(data_imputed[[col]])] <- median(data_imputed[[col]], na.rm = TRUE)
+}
+
+cat_cols <- names(data_imputed)[sapply(data_imputed, function(x) is.character(x) | is.factor(x))]
+for (col in cat_cols) {
+  mode_val <- names(sort(table(data_imputed[[col]]), decreasing = TRUE))[1]
+  data_imputed[[col]][is.na(data_imputed[[col]])] <- mode_val
+}
+
+rename_map <- c(
+  "Specific Surface Area (m^2/g)" = "SSA",
+  "Capacitance (F/g)" = "Capacitance",
+  "Cell Configuration (three/two electrode system)" = "Cell_Config"
+)
+
+existing_names <- names(rename_map)[names(rename_map) %in% colnames(data_imputed)]
+data_imputed <- data_imputed %>%
+  rename(!!!setNames(existing_names, rename_map[existing_names]))
+
+cat("Finalne wymiary zbioru po czyszczeniu:", nrow(data_imputed), "×", ncol(data_imputed), "\n")
+```
+
+# Rozmiar zbioru i podstawowe statystyki
+
+## Podsumowanie zbioru po czyszczeniu
+
+```{r data-summary}
+plot_missing(data_imputed, title = "Kompletność danych po czyszczeniu")
+
+cat("\nLiczba obserwacji:", nrow(data_imputed), "\n")
+cat("Liczba zmiennych:", ncol(data_imputed), "\n\n")
+
+num_vars <- data_imputed %>% select(where(is.numeric))
+data.frame(
+  Zmienna = names(num_vars),
+  Brakujące = sapply(num_vars, function(x) sum(is.na(x)))
+) %>%
+  kable(caption = "Tabela 8. Zmienne numeryczne po czyszczeniu",
+        col.names = c("Zmienna", "Liczba NA")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+cat_vars <- data_imputed %>% select(where(~ is.character(.) | is.factor(.)))
+data.frame(
+  Zmienna = names(cat_vars),
+  Brakujące = sapply(cat_vars, function(x) sum(is.na(x))),
+  Kategorie = sapply(cat_vars, function(x) n_distinct(x, na.rm = TRUE))
+) %>%
+  kable(caption = "Tabela 9. Zmienne kategoryczne po czyszczeniu",
+        col.names = c("Zmienna", "Liczba NA", "Liczba kategorii")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+## Statystyki opisowe
+
+```{r descriptive-stats}
+num_data <- data_imputed %>% select(where(is.numeric))
+num_data %>%
+  psych::describe() %>%
+  select(n, mean, sd, median, min, max, range, skew, kurtosis) %>%
+  kable(digits = 2, caption = "Tabela 10. Statystyki opisowe zmiennych numerycznych") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = TRUE,
+                font_size = 10)
+```
+
+Finalny zbiór danych zawiera 908 obserwacji i 12 zmiennych, w tym 9 numerycznych i 3 kategoryczne, wszystkie bez braków. Zmienne numeryczne charakteryzują się dużą zmiennością i asymetrią rozkładów - wiele z nich jest prawoskośnych, co oznacza, że większość wartości skupia się w dolnym zakresie, a pojedyncze obserwacje mają znacznie większe wartości. Podnosi to średnią powyżej mediany. Na przykład pojemność elektrod waha się od 1.4 do 3344 F/g, ze średnią 415.5 i medianą 260.3 F/g, co wskazuje na wyraźną prawostronną asymetrię.
+
+Natężenie prądu w stosunku do masy (Current density) ma ekstremalną wartość kurtozy - 106.15. Kurtoza opisuje „spiczastość” rozkładu i koncentrację obserwacji wokół średniej. Ta wysoka wartość ozncza, że parametr ma wiele ekstremalnych punktów, które mogą istotnie wpływać na analizę i modele ML. Potencjał elektrody wykazuje bardziej symetryczne rozkłady, a przewodność elektrolitu i jego stężenie są względnie stabilne. Prewodniść elektrolit est zmienną liczbową przyjmującą ogrnaniconą liczbę wartości całkowitych (od 1 do 8). W przypadku stężenia elektrolitu obserwuje się największą zmienność, ze standardowym odchyleniem wynoszącym 2. Wnioski dla analizy ML są takie, że należy uwzględnić nieliniowości, stosować modele odporne na wartości odstające oraz ewentualnie transformacje danych (np. log), szczególnie dla cech takich jak Capacitance czy Current Density.
+
+# Szczegółowa analiza wartości atrybutów
+
+## Rozkłady zmiennych numerycznych
+
+```{r distributions, fig.height=10}
+num_cols <- data_imputed %>% select(where(is.numeric)) %>% names()
+
+plots_list <- lapply(num_cols, function(col) {
+  ggplot(data_imputed, aes(x = .data[[col]])) +
+    geom_histogram(bins = 30, fill = "steelblue", color = "white", alpha = 0.8) +
+    geom_density(aes(y = after_stat(count)), color = "red", linewidth = 1) +
+    labs(title = col, x = "", y = "Częstość") +
+    theme_minimal() +
+    theme(plot.title = element_text(size = 10, face = "bold"))
+})
+
+gridExtra::grid.arrange(grobs = plots_list, ncol = 3, 
+                       top = "Rozkłady zmiennych numerycznych")
+```
+
+## Rozkłady zmiennych kategorycznych
+
+```{r categorical-distributions, fig.height=6}
+cat_cols <- data_imputed %>% select(where(~ is.character(.) | is.factor(.))) %>% names()
+
+for (col in cat_cols) {
+  p <- ggplot(data_imputed, aes(x = .data[[col]])) + 
+    geom_bar(fill = "steelblue", alpha = 0.8) +
+    labs(title = paste("Rozkład:", col), x = "", y = "Liczba obserwacji") + 
+    theme_minimal() + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+  print(p)
+}
+```
+
+Zmienna opisująca limity przedziałów wartości potencjału  jest zmienną kategoryczną o bardzo dużej liczbie kategorii i w dużej mierze powiela informacje zawarte już w zmiennych liczbowych. Nie będzie uwzględniana w dalszej analizie ani w modelach ML. 
+
+Pozostałe dwie zmienne kategoryczne mają akceptowalną liczbę kategorii - w danych występują 22 różne typy elektrolitów, z wyraźną dominacją KOH oraz H₂SO₄,   oraz dwa typy konfiguracji konduktora. Te zmienne zachowujemy do dalszej analizy. 
+
+## Test normalności rozkładów
+
+```{r normality-tests}
+check_normality <- function(data) {
+  num_cols <- names(data %>% select(where(is.numeric)))
+  results <- list()
+  for (col in num_cols) {
+    if (length(na.omit(data[[col]])) > 3) {
+      p_val <- shapiro.test(data[[col]])$p.value
+      results[[col]] <- ifelse(p_val > 0.05, "Rozkład Normalny", "Rozkład niezgodny z rozkładem normalnym")
+    }
+  }
+  return(results)   
+}  
+
+normality_results <- check_normality(data_imputed)
+
+data.frame(
+  Zmienna = names(normality_results),
+  Test_Shapiro_Wilka = unlist(normality_results)  
+) %>%
+  kable(caption = "Tabela 11. Wyniki testu normalności Shapiro-Wilka",
+        col.names = c("Zmienna", "Wynik testu (α = 0.05)")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))  
+```
+
+Wszystkie zmienne numeryczne wykazują istotne odchylenia od rozkładu normalnego (test Shapiro-Wilka, p < 0.05). Rozkłady charakteryzują się silną skośnością i wysoką kurtozą. W konsekwencji w dalszej analizie zastosowano współczynnik korelacji Spearmana.
+
+# Korelacje między zmiennymi
+
+## Korelacje zmiennych numerycznych
+
+```{r correlations-numeric, fig.height=8}
+cor_matrix_spear <- cor(num_data, use = "pairwise.complete.obs", method = "spearman")
+
+corrplot(cor_matrix_spear, method = "color", type = "upper", 
+         tl.cex = 0.8, tl.col = "black", addCoef.col = "black", 
+         number.cex = 0.6,
+         title = "Macierz korelacji Spearmana",
+         mar = c(0,0,2,0))
+
+cor_spear_df <- as.data.frame(cor_matrix_spear)
+cor_spear_df$Var1 <- rownames(cor_spear_df)
+cor_long <- cor_spear_df %>%
+  pivot_longer(-Var1, names_to = "Var2", values_to = "Corr") %>%
+  filter(Var1 != Var2) %>%
+  mutate(AbsCorr = abs(Corr)) %>%
+  arrange(desc(AbsCorr)) %>%
+  distinct(AbsCorr, .keep_all = TRUE) %>%
+  head(10)
+
+cor_long %>%
+  select(Var1, Var2, Corr) %>%
+  kable(digits = 3, caption = "Tabela 12. Najsilniejsze korelacje Spearmana",
+        col.names = c("Zmienna 1", "Zmienna 2", "Współczynnik ρ")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+
+Analiza korelacji wykazała słabe  zależności między zmiennymi. Najsilniejsze korelacje obserwowano między parametrami dotyczącymi przedzialów potencjału, ponieważ są one od siebie nauralnie zależne. Pojemność elektrody (Capacitance) wykazuje najsilniejszą korelację z przedziałem potencjału (-0.44). Ujemny znak korelacji wskazuje, że szersze przedziały potencjałusą związane z niższą pojemnością w porównaniu do wąskich przedziałów.
+
+## Korelacje zmiennych kategorycznych
+
+```{r correlations-categorical}
+cat_data <- data_imputed %>% select(where(~ is.character(.) | is.factor(.)))
+
+if (ncol(cat_data) > 1) {
+  cramer_matrix <- matrix(NA, ncol = ncol(cat_data), nrow = ncol(cat_data))
+  colnames(cramer_matrix) <- rownames(cramer_matrix) <- names(cat_data)
+  
+  for (i in 1:ncol(cat_data)) {
+    for (j in 1:ncol(cat_data)) {
+      if (i != j) {
+        cramer_matrix[i, j] <- DescTools::CramerV(table(cat_data[[i]], cat_data[[j]]))
+      } else {
+        cramer_matrix[i, j] <- 1
+      }
+    }
+  }
+  
+  corrplot(cramer_matrix, method = "color", type = "upper", 
+           tl.cex = 0.8, tl.col = "black", addCoef.col = "black", 
+           number.cex = 0.7,
+           title = "Macierz asocjacji Cramer's V",
+           mar = c(0,0,2,0))
+}
+```
+
+Zmienne kategoryczne porównane zostały z użyciem Cramer's V - miara siły związku między zmiennymi kategorycznymi. Zmienne kategoryczne opisują materiały użyte do ekspermentu oraz jego konfigurację ogniwa - wykazują więc dość duże korelacje między sobą.
+
+## Zależności kategoryczne-numeryczne
+
+Aby zbadać wpływ zmiennych kategorycznych (typ elektrolitu, konfiguracja ogniwa) na zmienne numeryczne, standardowo stosuje się ANOVA i Eta-squared.ANOVA wymaga spełnienia założeń:
+
+Normalność reszt w każdej grupie (test Shapiro-Wilka)
+Homogeniczność wariancji między grupami (test Levene'a)
+
+Sprawdzenie:
+
+```{r eta-squared}
+cat_cols <- names(data_imputed %>% select(where(~ is.character(.) | is.factor(.))))
+num_cols <- names(data_imputed %>% select(where(is.numeric)))
+
+cat("### Test założeń ANOVA dla wybranych par zmiennych:\n\n")
+
+test_pairs <- list(
+  c("Electrolyte Chemical Formula", "Capacitance"),
+  c("Cell_Config", "Capacitance"),
+  c("Electrolyte Chemical Formula", "Current Density (A/g)"),
+  c("Cell_Config", "SSA"),
+  c("Electrolyte Chemical Formula", "Potential Window (V)")
+)
+
+violations <- 0
+total <- 0
+
+for (pair in test_pairs) {
+  cat_var <- pair[1]
+  num_var <- pair[2]
+  
+  if (cat_var %in% cat_cols && num_var %in% num_cols) {
+    total <- total + 1
+    
+    #ANOVA
+    anova_model <- aov(data_imputed[[num_var]] ~ data_imputed[[cat_var]])
+    
+    #Test normalności reszt
+    residuals_vals <- residuals(anova_model)
+    if (length(residuals_vals) > 5000) {
+      residuals_vals <- sample(residuals_vals, 1000)
+    }
+    shapiro_p <- shapiro.test(residuals_vals)$p.value
+    
+    #Test homogeniczności wariancji
+    levene_test <- car::leveneTest(data_imputed[[num_var]] ~ as.factor(data_imputed[[cat_var]]))
+    levene_p <- levene_test$`Pr(>F)`[1]
+    
+    #Sprawdzenie założeń
+    norm_ok <- shapiro_p > 0.05
+    homo_ok <- levene_p > 0.05
+    
+    cat("**", pair[1], "→", pair[2], ":**\n")
+    cat("- Normalność:", ifelse(norm_ok, "Tak", "Nie"), "(p =", round(shapiro_p, 4), ")\n")
+    cat("- Homogeniczność:", ifelse(homo_ok, "Tak", "Nie"), "(p =", round(levene_p, 4), ")\n\n")
+    
+    if (!norm_ok || !homo_ok) {
+      violations <- violations + 1
+    }
+  }
+}
+
+cat("**", violations, "z", total, "par (", round(violations/total*100, 1), "%) Nie spełnia założeń ANOVA.**\n\n")
+```
+
+# Interaktywne wykresy
+
+## Wykres punktowy z dropdown
+
+```{r interactive-scatter}
+num_vars <- data_imputed %>% select(where(is.numeric)) %>% names()
+num_vars <- num_vars[num_vars != "Capacitance"]
+
+if (length(num_vars) > 0) {
+  tooltip_list <- lapply(num_vars, function(var) {
+    do.call(paste, c(lapply(colnames(data_imputed), function(col) {
+      paste0(col, ": ", data_imputed[[col]])
+    }), sep = "<br>"))
+  })
+  names(tooltip_list) <- num_vars
+  
+  axis_ranges <- lapply(num_vars, function(var) {
+    x_vals <- data_imputed[[var]]
+    x_min <- min(x_vals, na.rm = TRUE)
+    x_max <- max(x_vals, na.rm = TRUE)
+    x_range <- x_max - x_min
+    margin <- x_range * 0.1
+    list(min = x_min - margin, max = x_max + margin)
+  })
+  names(axis_ranges) <- num_vars
+  
+  create_scatter <- function(x_var) {
+    p <- ggplot(data_imputed, aes(x = .data[[x_var]], y = Capacitance, text = tooltip_list[[x_var]])) +
+      geom_point(alpha = 0.6, size = 2, color = "#2c7bb6") +
+      geom_smooth(method = "loess", se = TRUE, color = "red", linewidth = 1) +
+      labs(title = "Zależność pojemności od wybranej zmiennej", 
+           x = x_var, 
+           y = "Capacitance (F/g)") +
+      theme_minimal()
+    
+    ggplotly(p, tooltip = "text")
+  }
+  
+  scatter_plot <- create_scatter(num_vars[1])
+  
+  scatter_plot <- scatter_plot %>%
+    layout(
+      updatemenus = list(
+        list(
+          type = "dropdown",
+          buttons = lapply(num_vars, function(var) {
+            list(
+              method = "update",
+              args = list(
+                list(x = list(data_imputed[[var]]), text = list(tooltip_list[[var]])),
+                list(
+                  xaxis = list(
+                    title = var,
+                    range = c(axis_ranges[[var]]$min, axis_ranges[[var]]$max)
+                  )
+                )
+              ),
+              label = var
+            )
+          }),
+          direction = "down",
+          showactive = TRUE,
+          x = 0.1,
+          xanchor = "left",
+          y = 1.15,
+          yanchor = "top"
+        )
+      )
+    )
+  
+  scatter_plot
+}
+```
+
+Interaktywny wykres punktowy umożliwia eksplorację zależności między pojemnością a pozostałymi zmiennymi numerycznymi. Funkcja hover wyświetla wszystkie parametry danej elektrody po najechaniu na punkt, co ułatwia identyfikację właściwości materaiłów. Wykresy potwierdzają wysokie rozproszenie danych i brak prostych liniowych zależności.
+
+# Przygotowanie danych do modelowania ML
+
+## Analiza wartości odstających
+
+Przed budową modeli należy zbadać wartości odstające (outliers), które mogą obniżać dokładność modelum który uczy się anomalii zamiast prawdziwych wzorców.
+
+W analizie brana będzie pod uwagę zmienna Capacitance (zmienna docelowa): 
+   - ma dużw wartości kurtozy oraz skośności
+   - zakres 1.4-3344 F/g, a mediana to 260 F/g, więc pojedyncze wartości >1000 F/g mogą zdominować model
+
+oraz Current Density:
+   - ma bardzo wysoką kurtozę (106.15)
+   - mediana to 2 A/g, ale wartości odstajace mają >50 A/g
+
+```{r outlier-analysis}
+#statystyki IQR
+num_cols <- names(data_imputed %>% select(where(is.numeric)))
+
+outlier_stats <- data.frame(
+  Zmienna = character(),
+  Q1 = numeric(),
+  Q3 = numeric(),
+  IQR = numeric(),
+  Dolny_prog = numeric(),
+  Gorny_prog = numeric(),
+  Liczba_outliers = integer(),
+  Procent_outliers = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (col in num_cols) {
+  q1 <- quantile(data_imputed[[col]], 0.25, na.rm = TRUE)
+  q3 <- quantile(data_imputed[[col]], 0.75, na.rm = TRUE)
+  iqr <- q3 - q1
+  lower <- q1 - 1.5 * iqr
+  upper <- q3 + 1.5 * iqr
+  
+  outliers <- data_imputed[[col]] < lower | data_imputed[[col]] > upper
+  n_outliers <- sum(outliers, na.rm = TRUE)
+  pct_outliers <- round(n_outliers / nrow(data_imputed) * 100, 2)
+  
+  outlier_stats <- rbind(outlier_stats, data.frame(
+    Zmienna = col,
+    Q1 = q1,
+    Q3 = q3,
+    IQR = iqr,
+    Dolny_prog = lower,
+    Gorny_prog = upper,
+    Liczba_outliers = n_outliers,
+    Procent_outliers = pct_outliers
+  ))
+}
+
+outlier_stats %>%
+  arrange(desc(Procent_outliers)) %>%
+  kable(digits = 2, caption = "Tabela 17. Statystyki wartości odstających (metoda IQR 1.5×)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  row_spec(which(outlier_stats$Procent_outliers > 5), bold = TRUE, color = "white", background = "#e74c3c")
+
+
+```
+
+
+Zmienne, w których udział wartości odstających przekracza 5%, wymagają dodatkowej analizy, ponieważ mogą  zaburzać wyniki modelowania.
+W metodzie IQR za obserwacje odstające uznaje się te, które leżą poniżej Q1 − 1.5xIQR lub powyżej Q3 + 1.5xQR, co pozwala wyznaczyć wartości nietypowe .
+
+## Usuwanie ekstremalnych wartości odstających
+
+Zastosujemy proste obcięcie wartości ekstremalnych - usunięcie górne oraz dolne 0.5% wartości dla wszystkich zmiennych z >10% outlierów:
+SSA, Ratio of ID/IG, Lower Limit of Potential Window (V), Electrolyte Ionic Conductivity, Current Density (A/g).
+
+```{r outlier-removal}
+
+#Zmienne do obcięcia (>10% outlierów)
+vars_to_clip <- c("SSA", "Ratio of ID/IG", "Lower Limit of Potential Window (V)", 
+                  "Electrolyte Ionic Conductivity", "Current Density (A/g)")
+
+data_cleaned <- data_imputed
+
+cat("### Progi obcięcia (0.5% - 99.5%):\n")
+for (var in vars_to_clip) {
+  lower <- quantile(data_imputed[[var]], 0.005, na.rm = TRUE)
+  upper <- quantile(data_imputed[[var]], 0.995, na.rm = TRUE)
+  data_cleaned[[var]] <- pmin(pmax(data_cleaned[[var]], lower), upper)
+  cat(var, ": [", round(lower, 2), ",", round(upper, 2), "]\n")
+}
+
+```
+
+
+
+## Finalne przygotowanie danych
+
+```{r final-data-prep}
+
+model_data <- data_cleaned %>%
+  drop_na() %>%
+  select(-`Limits of Potential Window (V)`) %>%  #Usunięcie zmiennej tekstowej mającje już pokreyce w zmiennych numerycznych
+  mutate(
+    `Electrolyte Chemical Formula` = as.factor(`Electrolyte Chemical Formula`),
+    Cell_Config = as.factor(Cell_Config)
+  )
+```
+
+## Podział na zbiór treningowy i testowy
+
+```{r data-split}
+
+set.seed(123)
+train_index <- createDataPartition(model_data$Capacitance, p = 0.8, list = FALSE)
+train_data <- model_data[train_index, ]
+test_data <- model_data[-train_index, ]
+
+X_train <- train_data %>% select(-Capacitance)
+y_train <- train_data$Capacitance
+X_test <- test_data %>% select(-Capacitance)
+y_test <- test_data$Capacitance
+
+cat("Rozmiar zbioru treningowego:", nrow(train_data), "obserwacji\n")
+cat("Rozmiar zbioru testowego:", nrow(test_data), "obserwacji\n")
+```
+
+Dane podzielono stratyfikowanym losowaniem na zbiór treningowy (80%) i testowy (20%). Stratyfikacja zapewnia podobne rozkłady zmiennej docelowej w obu zbiorach.
+
+
+# Predykcja pojemności i wyjaśnialna sztuczna inteligencja
+
+## Model 1: Random Forest
+
+```{r random-forest}
+ctrl <- trainControl(method = "cv", number = 5)
+grid <- expand.grid(mtry = c(2, 4, 6))
+
+rf_model <- train(
+  x = X_train,
+  y = y_train,
+  method = "rf",
+  tuneGrid = grid,
+  trControl = ctrl,
+  ntree = 100,
+  importance = TRUE
+)
+
+cat("Najlepszy model Random Forest:\n")
+print(rf_model$bestTune)
+
+rf_predictions <- predict(rf_model, newdata = X_test)
+rf_metrics <- postResample(pred = rf_predictions, obs = y_test)
+
+cat("\nMetryki na zbiorze testowym:\n")
+print(rf_metrics)
+
+rf_results_df <- data.frame(
+  Observed = y_test,
+  Predicted = rf_predictions
+)
+
+ggplot(rf_results_df, aes(x = Observed, y = Predicted)) +
+  geom_point(alpha = 0.6, color = "#2c7bb6", size = 2) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red", linewidth = 1) +
+  labs(title = "Predykcje Random Forest",
+       x = "Rzeczywista pojemność (F/g)",
+       y = "Przewidywana pojemność (F/g)") +
+  theme_minimal()
+
+varImp(rf_model)$importance %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Feature") %>%
+  arrange(desc(Overall)) %>%
+  head(10) %>%
+  kable(digits = 2, caption = "Tabela 14. Ważność cech w modelu Random Forest",
+        col.names = c("Cecha", "Ważność")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+Model Random Forest z optymalnym parametrem mtry=4 osiągnął R² = 0.7 i RMSE = 237 F/g na zbiorze testowym. Wyniki wskazują na umiarkowaną zdolność predykcyjną. Najważniejszymi cechami są przedział wartości potencjału i natężenie podzielone przez masę elektrody (Current density).
+
+## Model 2: Support Vector Regression
+
+```{r svr}
+all_X <- rbind(X_train, X_test)
+dummyVars_model <- dummyVars(~ ., data = all_X, fullRank = TRUE)
+all_X_dummy <- predict(dummyVars_model, newdata = all_X)
+
+train_rows <- 1:nrow(X_train)
+X_train_dummy <- all_X_dummy[train_rows, ]
+X_test_dummy <- all_X_dummy[-train_rows, ]
+
+svr_grid <- expand.grid(
+  sigma = c(0.01, 0.1, 1),
+  C = c(1, 10, 100)
+)
+
+svr_control <- trainControl(method = "cv", number = 3, verboseIter = FALSE)
+
+set.seed(123)
+svr_model <- train(
+  x = X_train_dummy,
+  y = y_train,
+  method = "svmRadial",
+  trControl = svr_control,
+  tuneGrid = svr_grid,
+  preProcess = c("center", "scale")
+)
+
+svr_predictions <- predict(svr_model, newdata = X_test_dummy)
+svr_metrics <- postResample(pred = svr_predictions, obs = y_test)
+
+cat("**Najlepsze parametry SVR:** sigma =", svr_model$bestTune$sigma, ", C =", svr_model$bestTune$C, "\n\n")
+cat("**Metryki na zbiorze testowym:**\n")
+cat("- RMSE:", round(svr_metrics["RMSE"], 2), "\n")
+cat("- R²:", round(svr_metrics["Rsquared"], 3), "\n")
+cat("- MAE:", round(svr_metrics["MAE"], 2), "\n")
+```
+
+## Model 3: Elastic Net
+
+```{r elastic-net}
+elastic_grid <- expand.grid(
+  alpha = c(0, 0.5, 1),
+  lambda = 10^seq(-3, 1, length = 10)
+)
+
+elastic_control <- trainControl(method = "cv", number = 5, verboseIter = FALSE)
+
+set.seed(123)
+elastic_model <- train(
+  x = X_train,
+  y = y_train,
+  method = "glmnet",
+  trControl = elastic_control,
+  tuneGrid = elastic_grid,
+  preProcess = c("center", "scale")
+)
+
+elastic_predictions <- predict(elastic_model, newdata = X_test)
+elastic_metrics <- postResample(pred = elastic_predictions, obs = y_test)
+
+cat("**Najlepsze parametry Elastic Net:** alpha =", elastic_model$bestTune$alpha, ", lambda =", elastic_model$bestTune$lambda, "\n\n")
+cat("**Metryki na zbiorze testowym:**\n")
+cat("- RMSE:", round(elastic_metrics["RMSE"], 2), "\n")
+cat("- R²:", round(elastic_metrics["Rsquared"], 3), "\n")
+cat("- MAE:", round(elastic_metrics["MAE"], 2), "\n")
+```
+
+## Porównanie modeli
+
+```{r model-comparison}
+comparison_df <- data.frame(
+  Model = c("Random Forest", "SVR", "Elastic Net"),
+  RMSE = c(rf_metrics["RMSE"], svr_metrics["RMSE"], elastic_metrics["RMSE"]),
+  R2 = c(rf_metrics["Rsquared"], svr_metrics["Rsquared"], elastic_metrics["Rsquared"]),
+  MAE = c(rf_metrics["MAE"], svr_metrics["MAE"], elastic_metrics["MAE"])
+)
+
+comparison_df %>%
+  kable(digits = 2, caption = "Tabela 15. Porównanie modeli predykcyjnych",
+        col.names = c("Model", "RMSE", "R²", "MAE")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+comparison_plot_df <- data.frame(
+  Observed = rep(y_test, 3),
+  Predicted = c(rf_predictions, svr_predictions, elastic_predictions),
+  Model = rep(c("Random Forest", "SVR", "Elastic Net"), each = length(y_test))
+)
+
+ggplot(comparison_plot_df, aes(x = Observed, y = Predicted, color = Model)) +
+  geom_point(alpha = 0.5, size = 2) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "black") +
+  facet_wrap(~Model) +
+  labs(title = "Porównanie predykcji trzech modeli",
+       x = "Rzeczywista pojemność (F/g)",
+       y = "Przewidywana pojemność (F/g)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+Random Forest okazał się najlepszym modelem spośród trzech testowanych algorytmów, osiągając najniższy RMSE i najwyższy R². SVR i Elastic Net wykazały niższą dokładność, co może wynikać z nieliniowego charakteru zależności w danych.
+
+## Interpretacja modelu za pomocą SHAP
+
+```{r shap-analysis, fig.height=10}
+if (!requireNamespace("fastshap", quietly = TRUE)) {
+  install.packages("fastshap")
+}
+library(fastshap)
+
+pred_wrapper <- function(object, newdata) {
+  predict(object, newdata = newdata)
+}
+
+set.seed(123)
+shap_values <- fastshap::explain(
+  rf_model,
+  X = X_test,
+  nsim = 50,
+  pred_wrapper = pred_wrapper
+)
+
+shap_df <- as.data.frame(shap_values)
+
+shap_summary <- shap_df %>%
+  pivot_longer(everything(), names_to = "Feature", values_to = "SHAP") %>%
+  mutate(AbsSHAP = abs(SHAP)) %>%
+  group_by(Feature) %>%
+  summarise(MeanAbsSHAP = mean(AbsSHAP, na.rm = TRUE)) %>%
+  arrange(desc(MeanAbsSHAP))
+
+ggplot(shap_summary, aes(x = reorder(Feature, MeanAbsSHAP), y = MeanAbsSHAP)) +
+  geom_col(fill = "#d7191c", alpha = 0.9) +
+  coord_flip() +
+  labs(title = "Ważność cech według SHAP",x = "Cecha",y = "Średnia wartość |SHAP|") + theme_minimal()
+
+shap_summary %>%
+  kable(digits = 2, caption = "Tabela 16. Ważność cech według wartości SHAP",
+        col.names = c("Cecha", "Średnia SHAP")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+
+if (nrow(shap_df) > 0) {
+  single_shap <- shap_df[1, ]
+  bar_data <- data.frame(
+    Feature = names(single_shap), 
+    SHAP = as.numeric(single_shap)
+  ) %>%
+    arrange(desc(abs(SHAP)))
+  
+  ggplot(bar_data, aes(x = reorder(Feature, SHAP), y = SHAP, fill = SHAP > 0)) +
+    geom_col() +
+    coord_flip() +
+    scale_fill_manual(values = c("TRUE" = "#d7191c", "FALSE" = "#2c7bb6"), labels = c("Zwiększa", "Zmniejsza")) +
+    labs(title = "Dekompozycja SHAP dla przykładowej obserwacji", x = "Cecha",  y = "Wpływ SHAP na predykcję",fill = "Kierunek wpływu") +
+    theme_minimal()
+}
+```
+
+Analiza SHAP potwierdza kluczową rolę parametrów testowych (przedział wartości potencjału, wzór chemiczny elektorlitu, jego stężenie) w predykcji pojemności. Dodatnie wartości SHAP wskazują na wzrost predykcji pojemności, podczas gdy ujemne na jej spadek. Przykładowa dekompozycja pojedynczej obserwacji ilustruje, jak poszczególne cechy przyczyniają się do finalnej predykcji modelu.
+
+# Wnioski
+
+## Podsumowanie wyników
+Zbiór po czyszczeniu zawierał 908 obserwacji i 12 zmiennych bez wartości brakujących, co stanowi 98% pierwotnego zbioru.
+Wszystkie zmienne numeryczne wykazują istotne odchylenia od rozkładu normalnego, z przewagą rozkładów prawostronnie skośnych i wysoką kurtozą.
+Zależności między zmiennymi są przeważnie słabe. Najsilniejsze korelacje dotyczą parametrów okna potencjału.
+Random Forest osiągnął najlepsze wyniki (R² = 0.7), przewyższając SVR i Elastic Net.
+Analiza SHAP wykazała dominującą rolę zmiennych opisujących warunki testowe (przedział wartości potencjału, wzór chemiczny elektrolitu) nad właściwościami materiałowymi w określeniu pojemności.
+Model nieliniowy (Random Forest) okazał się znacznie skuteczniejszy niż metody liniowe (SVR, Elastic Net), co potwierdza złożoność zależności między cechami a pojemnością.
+Wyniki podkreślają kluczowe znaczenie optymalizacji warunków eksperymentalnych (zakres potencjału, typ i stężenie elektrolitu) dla uzyskania wysokiej pojemności elektrod grafenowych.
+
+## Ograniczenia analizy:
+- Brak wielu istotnych parametrów materiałowych, które zostały usunięte z powodu zbyt dużej ilości braków w danych
+- Wysoka heterogeniczność danych (różne metody syntezy, warunki testowe)
+- Ograniczona reprezentacja materiałów o wysokiej pojemności (>1000 F/g)
+
+
